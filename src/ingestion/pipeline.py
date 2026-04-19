@@ -198,6 +198,7 @@ class IngestionPipeline:
         file_path: str,
         trace: Optional[TraceContext] = None,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
+        source_path: Optional[str] = None,
     ) -> PipelineResult:
         """在文件上执行完整的摄取 Pipeline。
 
@@ -208,11 +209,14 @@ class IngestionPipeline:
                 在每个 Pipeline 阶段完成时调用。*current* 是
                 已完成阶段的基于 1 的索引；*total* 是
                 阶段总数（当前为 6）。
+            source_path: 原始文件路径（用于记录到数据库）。
+                当 file_path 是临时文件时，传入原始文件名以保持可追溯性。
 
         返回：
             PipelineResult，包含成功状态和统计信息
         """
         file_path = Path(file_path)
+        _source_path = source_path if source_path else str(file_path)
         stages: Dict[str, Any] = {}
         _total_stages = 6
 
@@ -606,7 +610,7 @@ class IngestionPipeline:
             # ─────────────────────────────────────────────────────────────
             # 标记成功
             # ─────────────────────────────────────────────────────────────
-            self.integrity_checker.mark_success(file_hash, str(file_path), self.collection)
+            self.integrity_checker.mark_success(file_hash, _source_path, self.collection)
 
             logger.info("\n" + "=" * 60)
             logger.info("✅ Pipeline 成功完成！")

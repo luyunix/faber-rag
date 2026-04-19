@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     pass
 
 
-SERVER_NAME = "faber-rag"
+SERVER_NAME = "faya-rag"
 SERVER_VERSION = "0.1.0"
 
 

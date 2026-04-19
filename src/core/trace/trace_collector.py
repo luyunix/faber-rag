@@ -41,14 +41,14 @@ class TraceCollector:
         参数：
             trace: 一个已填充的 :class:`TraceContext`。
         """
-        if trace.finished_at is None:
-            trace.finish()
-
-        line = json.dumps(trace.to_dict(), ensure_ascii=False)
         try:
+            if trace.finished_at is None:
+                trace.finish()
+
+            line = json.dumps(trace.to_dict(), ensure_ascii=False)
             with self._path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-        except OSError:
+        except Exception:
             logger.exception("写入追踪 %s 失败", trace.trace_id)
 
     @property

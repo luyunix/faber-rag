@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "niyulu", email = "niyulu695@163.com" }
 ]
 keywords = ["mcp", "rag", "retrieval", "llm", "knowledge-base"]
 classifiers = [
@@ -30,10 +30,13 @@ dependencies = [
     "mcp>=1.0.0",
     "jieba>=0.42",
     "markitdown[pdf]>=0.1.0",
-    "streamlit>=1.30.0",
     "ragas>=0.1.0",
     "datasets>=2.0.0",
     "python-dotenv>=1.0.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.0.0",
+    "aiohttp>=3.9.0",
 ]
 
 [project.optional-dependencies]
@@ -48,8 +51,7 @@ dev = [
 ]
 
 [project.scripts]
-mcp-server = "main:main"
-faber-start = "scripts.start:main"
+faber = "src.main:main"
 
 # 国内 PyPI 镜像源配置（阿里云镜像源）
 # 适用于 uv 包管理工具：https://docs.astral.sh/uv/concepts/configuration-files/

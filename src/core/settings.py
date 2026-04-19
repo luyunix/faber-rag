@@ -1,10 +1,10 @@
-"""Faber RAG的配置加载和验证。"""
+"""Faya RAG 的配置加载和验证。"""
 
 from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -225,13 +225,29 @@ class VisionLLMSettings:
 
 
 @dataclass(frozen=True)
+class ChunkRefinerSettings:
+    use_llm: bool = False
+    batch_mode: bool = True
+    batch_size: int = 10
+    prompt_path: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MetadataEnricherSettings:
+    use_llm: bool = False
+    batch_mode: bool = True
+    batch_size: int = 10
+    prompt_path: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class IngestionSettings:
     chunk_size: int
     chunk_overlap: int
     splitter: str
     batch_size: int
-    chunk_refiner: Optional[Dict[str, Any]] = None  # 动态配置
-    metadata_enricher: Optional[Dict[str, Any]] = None  # 动态配置
+    chunk_refiner: ChunkRefinerSettings = field(default_factory=lambda: ChunkRefinerSettings())
+    metadata_enricher: MetadataEnricherSettings = field(default_factory=lambda: MetadataEnricherSettings())
 
 
 @dataclass(frozen=True)
@@ -262,13 +278,32 @@ class Settings:
         ingestion_settings = None
         if "ingestion" in data:
             ingestion = _require_mapping(data, "ingestion", "settings")
+
+            # 解析 chunk_refiner 配置
+            chunk_refiner_data = ingestion.get("chunk_refiner", {})
+            chunk_refiner = ChunkRefinerSettings(
+                use_llm=chunk_refiner_data.get("use_llm", False),
+                batch_mode=chunk_refiner_data.get("batch_mode", True),
+                batch_size=chunk_refiner_data.get("batch_size", 10),
+                prompt_path=chunk_refiner_data.get("prompt_path"),
+            )
+
+            # 解析 metadata_enricher 配置
+            metadata_enricher_data = ingestion.get("metadata_enricher", {})
+            metadata_enricher = MetadataEnricherSettings(
+                use_llm=metadata_enricher_data.get("use_llm", False),
+                batch_mode=metadata_enricher_data.get("batch_mode", True),
+                batch_size=metadata_enricher_data.get("batch_size", 10),
+                prompt_path=metadata_enricher_data.get("prompt_path"),
+            )
+
             ingestion_settings = IngestionSettings(
                 chunk_size=_require_int(ingestion, "chunk_size", "ingestion"),
                 chunk_overlap=_require_int(ingestion, "chunk_overlap", "ingestion"),
                 splitter=_require_str(ingestion, "splitter", "ingestion"),
                 batch_size=_require_int(ingestion, "batch_size", "ingestion"),
-                chunk_refiner=ingestion.get("chunk_refiner"),  # 可选配置
-                metadata_enricher=ingestion.get("metadata_enricher"),  # 可选配置
+                chunk_refiner=chunk_refiner,
+                metadata_enricher=metadata_enricher,
             )
 
         vision_llm_settings = None

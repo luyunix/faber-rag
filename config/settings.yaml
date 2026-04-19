@@ -8,7 +8,7 @@
 llm:
   provider: "qwen"  # Options: openai, azure, ollama, deepseek, qwen
   # Qwen (通义千问) via DashScope OpenAI-compatible API
-  model: "qwen-plus"  # Options: qwen-turbo, qwen-plus, qwen-max, qwen-coder-plus
+  model: "qwen-plus-latest"  # Options: qwen-turbo, qwen-plus, qwen-max, qwen-coder-plus
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   api_key: "${DASHSCOPE_API_KEY}"  # 从环境变量加载
   temperature: 0.0
@@ -94,10 +94,14 @@ ingestion:
   
   # Chunk Refiner Configuration (C5)
   chunk_refiner:
-    use_llm: true  # Set to true to enable LLM-based refinement (requires LLM config)
-    # When use_llm is false or LLM call fails, falls back to rule-based refinement
-  
+    use_llm: true      # 启用 LLM 精化（消耗额度）
+    batch_mode: false   # true=批量处理（省额度），false=逐 chunk 并行（高质量）
+    batch_size: 10     # 每批处理的 chunk 数，越大 API 调用越少但单次请求越重
+    # prompt_path: "config/prompts/custom_refinement.txt"  # 可选：自定义 prompt
+
   # Metadata Enricher Configuration (C6)
   metadata_enricher:
-    use_llm: true  # Set to true to enable LLM-based enrichment (requires LLM config)
-    # When use_llm is false or LLM call fails, falls back to rule-based enrichment
+    use_llm: true      # 启用 LLM 元数据增强（消耗额度）
+    batch_mode: false   # true=批量处理（省额度），false=逐 chunk 并行（高质量）
+    batch_size: 10     # 每批处理的 chunk 数
+    # prompt_path: "config/prompts/custom_enrichment.txt"  # 可选：自定义 prompt

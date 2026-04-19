@@ -1,23 +1,23 @@
-You are a metadata extraction assistant. Analyze the following text chunk and generate enriched metadata.
+你是一名元数据提取助手。请分析以下文本片段并生成增强后的元数据。
 
-Text Chunk:
+文本片段：
 ```
 {chunk_text}
 ```
 
-Instructions:
-1. Generate a concise, descriptive title (max 150 characters) that captures the main topic
-2. Write a summary (2-3 sentences, max 500 characters) that explains the key content
-3. Extract 3-10 relevant tags/keywords that categorize the content
+指令：
+1. 生成一个简洁、描述性的标题（最多 150 字），概括核心主题
+2. 撰写一段摘要（2-3 句话，最多 500 字），说明关键内容
+3. 提取 3-10 个相关的标签/关键词，用于内容分类
 
-Format your response exactly as follows:
-Title: <your generated title>
-Summary: <your generated summary>
-Tags: <tag1>, <tag2>, <tag3>, ...
+请严格按照以下格式输出：
+Title: <生成的标题>
+Summary: <生成的摘要>
+Tags: <标签1>, <标签2>, <标签3>, ...
 
-Requirements:
-- Title should be clear and informative, not generic
-- Summary should capture the essence, not just repeat the title
-- Tags should be specific topics, concepts, or entities mentioned in the text
-- Use comma-separated values for tags
-- Be concise and precise
+要求：
+- 标题应清晰、有信息量，避免泛泛而谈
+- 摘要应抓住核心要点，而非简单重复标题
+- 标签应为文本中提到的具体主题、概念或实体
+- 标签之间用逗号分隔
+- 简洁、准确

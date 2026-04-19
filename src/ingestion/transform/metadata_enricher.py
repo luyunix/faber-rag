@@ -1,8 +1,7 @@
 """元数据增强转换：基于规则 + 可选 LLM 增强。"""
 
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Dict, Any, Tuple
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 
 from src.core.settings import Settings, resolve_path
@@ -50,7 +49,7 @@ class MetadataEnricher(BaseTransform):
         prompt_path: Optional[str] = None
     ):
         """初始化 MetadataEnricher。
-        
+
         参数：
             settings: 应用配置
             llm: 可选的 LLM 实例（用于测试；如果为 None 则自动创建）
@@ -60,18 +59,21 @@ class MetadataEnricher(BaseTransform):
         self._llm = llm
         self._prompt_template: Optional[str] = None
         self._prompt_path = prompt_path or str(resolve_path("config/prompts/metadata_enrichment.txt"))
-        
-        # 确定是否应该使用 LLM
-        enricher_config = {}
+        self._batch_prompt_path = str(resolve_path("config/prompts/metadata_enrichment_batch.txt"))
+
+        # 读取 metadata_enricher 配置（支持 dataclass 和 dict 两种格式）
+        enricher_config = None
         if hasattr(settings, 'ingestion') and settings.ingestion is not None:
-            ingestion_config = settings.ingestion
-            # 检查 ingestion 是否有 metadata_enricher 属性（dataclass）或 dict
-            if hasattr(ingestion_config, 'metadata_enricher') and ingestion_config.metadata_enricher:
-                enricher_config = ingestion_config.metadata_enricher
-            elif isinstance(ingestion_config, dict):
-                enricher_config = ingestion_config.get('metadata_enricher', {})
-        
-        self.use_llm = enricher_config.get('use_llm', False) if enricher_config else False
+            enricher_config = getattr(settings.ingestion, 'metadata_enricher', None)
+
+        if enricher_config is not None:
+            self.use_llm = getattr(enricher_config, 'use_llm', False)
+            self.batch_mode = getattr(enricher_config, 'batch_mode', True)
+            self.batch_size = getattr(enricher_config, 'batch_size', 10)
+        else:
+            self.use_llm = False
+            self.batch_mode = True
+            self.batch_size = 10
         
     @property
     def llm(self) -> Optional[BaseLLM]:
@@ -91,237 +93,222 @@ class MetadataEnricher(BaseTransform):
         trace: Optional[TraceContext] = None
     ) -> List[Chunk]:
         """通过增强元数据转换 chunk。
-        
+
         参数：
             chunks: 要增强的 chunk 列表
             trace: 可选的跟踪上下文
-            
+
         返回：
             已增强的 chunk 列表（与输入长度相同）
         """
         if not chunks:
             return []
-        
-        # 进程 chunks in parallel if LLM is enabled
-        if self.use_llm and self.llm:
-            return self._transform_parallel(chunks, trace)
-        else:
-            return self._transform_sequential(chunks, trace)
-    
-    def _enrich_single_chunk(
-        self, 
-        chunk: Chunk, 
-        trace: Optional[TraceContext] = None
-    ) -> Tuple[Chunk, str, Optional[str]]:
-        """Enrich a single chunk. Thread-safe.
-        
-        Args:
-            chunk: Chunk to enrich
-            trace: Optional trace context
-            
-        Returns:
-            Tuple of (enriched_chunk, enriched_by, error_message)
-        """
-        try:
-            # 步骤 1: Rule-based enrichment
+
+        # 步骤 1: 所有 chunks 先做规则增强
+        rule_enriched: List[Chunk] = []
+        for chunk in chunks:
             rule_metadata = self._rule_based_enrich(chunk.text)
-            
-            # 步骤 2: LLM enhancement
-            if self.use_llm and self.llm:
-                llm_metadata = self._llm_enrich(chunk.text, trace)
-                
-                if llm_metadata:
-                    enriched_metadata = llm_metadata
-                    enriched_by = "llm"
-                else:
-                    enriched_metadata = rule_metadata
-                    enriched_by = "rule"
-                    enriched_metadata['enrich_fallback_reason'] = "llm_failed"
-            else:
-                enriched_metadata = rule_metadata
-                enriched_by = "rule"
-            
             final_metadata = {
                 **(chunk.metadata or {}),
-                **enriched_metadata,
-                'enriched_by': enriched_by
+                **rule_metadata,
+                'enriched_by': 'rule'
             }
-            
-            enriched_chunk = Chunk(
+            rule_enriched.append(Chunk(
                 id=chunk.id,
                 text=chunk.text,
                 metadata=final_metadata,
                 source_ref=chunk.source_ref
-            )
-            return (enriched_chunk, enriched_by, None)
-            
-        except Exception as e:
-            logger.error(f"Failed to enrich chunk {chunk.id}: {e}")
-            text_preview = ""
-            if chunk.text:
-                text_preview = chunk.text[:100] + '...' if len(chunk.text) > 100 else chunk.text
-            minimal_metadata = {
-                **(chunk.metadata or {}),
-                'title': 'Untitled',
-                'summary': text_preview,
-                'tags': [],
-                'enriched_by': 'error',
-                'enrich_error': str(e)
-            }
-            enriched_chunk = Chunk(
-                id=chunk.id,
-                text=chunk.text or "",
-                metadata=minimal_metadata,
-                source_ref=chunk.source_ref
-            )
-            return (enriched_chunk, "error", str(e))
+            ))
+
+        # 步骤 2: 如果启用 LLM，根据 batch_mode 选择处理方式
+        if self.use_llm and self.llm:
+            if self.batch_mode:
+                return self._transform_batch(rule_enriched, trace)
+            else:
+                return self._transform_parallel(rule_enriched, trace)
+
+        return rule_enriched
     
     def _transform_parallel(
-        self, 
-        chunks: List[Chunk], 
+        self,
+        chunks: List[Chunk],
         trace: Optional[TraceContext] = None
     ) -> List[Chunk]:
-        """Process chunks in parallel using ThreadPoolExecutor."""
+        """逐 chunk 并行调用 LLM（batch_mode=false）。"""
+        import concurrent.futures
+
         max_workers = min(DEFAULT_MAX_WORKERS, len(chunks))
         enriched_chunks = [None] * len(chunks)
         llm_enhanced_count = 0
         fallback_count = 0
-        
-        logger.debug(f"Processing {len(chunks)} chunks in parallel (max_workers={max_workers})")
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_idx = {
                 executor.submit(self._enrich_single_chunk, chunk, trace): idx
                 for idx, chunk in enumerate(chunks)
             }
-            
-            for future in as_completed(future_to_idx):
+            for future in concurrent.futures.as_completed(future_to_idx):
                 idx = future_to_idx[future]
                 try:
-                    enriched_chunk, enriched_by, error = future.result()
+                    enriched_chunk, enriched_by, _ = future.result()
                     enriched_chunks[idx] = enriched_chunk
-                    
                     if enriched_by == "llm":
                         llm_enhanced_count += 1
-                    elif enriched_by == "rule" and error is None:
+                    elif enriched_by == "rule":
                         fallback_count += 1
                 except Exception as e:
                     logger.error(f"Unexpected error in parallel enrichment: {e}")
                     enriched_chunks[idx] = chunks[idx]
-        
-        success_count = sum(1 for c in enriched_chunks if c is not None)
-        
+
         if trace:
             trace.record_stage("metadata_enricher", {
                 "total_chunks": len(chunks),
-                "success_count": success_count,
                 "llm_enhanced_count": llm_enhanced_count,
                 "fallback_count": fallback_count,
                 "use_llm": self.use_llm,
+                "batch_mode": False,
                 "parallel": True,
-                "max_workers": max_workers
+                "max_workers": max_workers,
             })
-        
+
         logger.info(
-            f"Enriched {success_count}/{len(chunks)} chunks "
-            f"(LLM: {llm_enhanced_count}, Fallback: {fallback_count})"
+            f"Enriched {len(chunks)} chunks (batch_mode=false) "
+            f"(LLM: {llm_enhanced_count}, fallback: {fallback_count})"
         )
-        
+
         return enriched_chunks
-    
-    def _transform_sequential(
-        self, 
-        chunks: List[Chunk], 
+
+    def _enrich_single_chunk(
+        self,
+        chunk: Chunk,
+        trace: Optional[TraceContext] = None
+    ):
+        """增强单个 chunk 的元数据。"""
+        try:
+            if self.use_llm and self.llm:
+                llm_metadata = self._llm_enrich(chunk.text, trace)
+                if llm_metadata:
+                    final_metadata = {
+                        **(chunk.metadata or {}),
+                        **llm_metadata,
+                        'enriched_by': 'llm'
+                    }
+                    enriched_chunk = Chunk(
+                        id=chunk.id,
+                        text=chunk.text,
+                        metadata=final_metadata,
+                        source_ref=chunk.source_ref
+                    )
+                    return (enriched_chunk, "llm", None)
+
+            # 回退到 rule-based（已在 transform() 中预填充）
+            return (chunk, "rule", None)
+
+        except Exception as e:
+            logger.error(f"Failed to enrich chunk {chunk.id}: {e}")
+            return (chunk, "error", str(e))
+
+    def _transform_batch(
+        self,
+        chunks: List[Chunk],
         trace: Optional[TraceContext] = None
     ) -> List[Chunk]:
-        """Process chunks sequentially (fallback when LLM disabled)."""
-        enriched_chunks = []
-        success_count = 0
+        """使用批量 LLM 调用增强 chunks。"""
         llm_enhanced_count = 0
         fallback_count = 0
-        
-        for chunk in chunks:
+        results = {chunk.id: chunk for chunk in chunks}
+
+        for i in range(0, len(chunks), self.batch_size):
+            batch = chunks[i:i + self.batch_size]
             try:
-                # 步骤 1: Rule-based enrichment (always performed)
-                rule_metadata = self._rule_based_enrich(chunk.text)
-                
-                # 步骤 2: 可选 LLM enhancement
-                if self.use_llm and self.llm:
-                    llm_metadata = self._llm_enrich(chunk.text, trace)
-                    
-                    if llm_metadata:
-                        # LLM success
-                        enriched_metadata = llm_metadata
-                        enriched_by = "llm"
+                llm_results = self._llm_enrich_batch(batch, trace)
+                for chunk_id, metadata in llm_results.items():
+                    if chunk_id in results:
+                        results[chunk_id].metadata.update(metadata)
+                        results[chunk_id].metadata['enriched_by'] = 'llm'
                         llm_enhanced_count += 1
-                    else:
-                        # LLM failed, fallback to rule-based
-                        enriched_metadata = rule_metadata
-                        enriched_by = "rule"
-                        fallback_count += 1
-                        enriched_metadata['enrich_fallback_reason'] = "llm_failed"
-                else:
-                    # LLM disabled, use rule-based
-                    enriched_metadata = rule_metadata
-                    enriched_by = "rule"
-                
-                # Merge enriched metadata with existing metadata
-                final_metadata = {
-                    **(chunk.metadata or {}),
-                    **enriched_metadata,
-                    'enriched_by': enriched_by
-                }
-                
-                # 创建 enriched chunk
-                enriched_chunk = Chunk(
-                    id=chunk.id,
-                    text=chunk.text,
-                    metadata=final_metadata,
-                    source_ref=chunk.source_ref
-                )
-                enriched_chunks.append(enriched_chunk)
-                success_count += 1
-                
             except Exception as e:
-                # Atomic failure: log and preserve original with minimal metadata
-                logger.error(f"Failed to enrich chunk {chunk.id}: {e}")
-                # Handle 空 text case
-                text_preview = ""
-                if chunk.text:
-                    text_preview = chunk.text[:100] + '...' if len(chunk.text) > 100 else chunk.text
-                minimal_metadata = {
-                    **(chunk.metadata or {}),
-                    'title': 'Untitled',
-                    'summary': text_preview,
-                    'tags': [],
-                    'enriched_by': 'error',
-                    'enrich_error': str(e)
-                }
-                enriched_chunk = Chunk(
-                    id=chunk.id,
-                    text=chunk.text or "",  # Ensure text is not None
-                    metadata=minimal_metadata,
-                    source_ref=chunk.source_ref
-                )
-                enriched_chunks.append(enriched_chunk)
-        
-        # 记录 trace
+                logger.warning(f"Batch LLM enrichment failed for chunks {i}-{i + len(batch)}: {e}")
+                fallback_count += len(batch)
+
+        for chunk in results.values():
+            if chunk.metadata.get('enriched_by') != 'llm':
+                chunk.metadata['enriched_by'] = 'rule'
+
         if trace:
             trace.record_stage("metadata_enricher", {
                 "total_chunks": len(chunks),
-                "success_count": success_count,
                 "llm_enhanced_count": llm_enhanced_count,
                 "fallback_count": fallback_count,
                 "use_llm": self.use_llm,
-                "parallel": False
+                "batch_size": self.batch_size,
             })
-        
+
         logger.info(
-            f"Enriched {success_count}/{len(chunks)} chunks "
+            f"Enriched {len(chunks)} chunks "
             f"(LLM: {llm_enhanced_count}, Fallback: {fallback_count})"
         )
-        
-        return enriched_chunks
+
+        return list(results.values())
+
+    def _llm_enrich_batch(
+        self,
+        chunks: List[Chunk],
+        trace: Optional[TraceContext] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """一次 LLM 调用增强一批 chunks。
+
+        返回：
+            {chunk_id: metadata_dict} 字典
+        """
+        prompt_template = self._load_prompt_batch()
+        if not prompt_template:
+            logger.warning("Batch prompt template not found, skipping LLM enrichment")
+            return {}
+
+        chunks_text = ""
+        for chunk in chunks:
+            text_preview = chunk.text[:2000] if chunk.text else ""
+            chunks_text += f"--- CHUNK_START:{chunk.id} ---\n{text_preview}\n--- CHUNK_END:{chunk.id} ---\n\n"
+
+        prompt = (
+            prompt_template
+            .replace("{chunk_count}", str(len(chunks)))
+            .replace("{chunks}", chunks_text)
+        )
+
+        messages = [Message(role="user", content=prompt)]
+        response = self.llm.chat(messages)
+
+        response_text = response.content if hasattr(response, "content") else str(response)
+        return self._parse_batch_response(response_text)
+
+    def _parse_batch_response(self, response: str) -> Dict[str, Dict[str, Any]]:
+        """从批量 LLM 响应中解析每个 chunk 的元数据。
+
+        返回：
+            {chunk_id: metadata_dict} 字典
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+        pattern = r"---\s*CHUNK_START:\s*([^\s]+)\s*---\n(.*?)\n---\s*CHUNK_END:\s*\1\s*---"
+        for match in re.finditer(pattern, response, re.DOTALL):
+            chunk_id = match.group(1).strip()
+            content = match.group(2).strip()
+            metadata = self._parse_llm_response(content)
+            results[chunk_id] = metadata
+        return results
+
+    def _load_prompt_batch(self) -> str:
+        """加载批量增强 prompt 模板。"""
+        try:
+            prompt_path = Path(self._batch_prompt_path)
+            if not prompt_path.exists():
+                logger.warning(f"Batch prompt file not found: {self._batch_prompt_path}")
+                return ""
+            return prompt_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to load batch prompt template: {e}")
+            return ""
     
     def _rule_based_enrich(self, text: str) -> Dict[str, Any]:
         """使用基于规则的启发式方法提取元数据。

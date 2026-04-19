@@ -1,9 +1,8 @@
 """Chunk 优化转换：基于规则的清理 + 可选 LLM 增强。"""
 
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from src.core.settings import Settings, resolve_path
 from src.core.types import Chunk
@@ -54,13 +53,21 @@ class ChunkRefiner(BaseTransform):
         self._llm = llm
         self._prompt_template: Optional[str] = None
         self._prompt_path = prompt_path or str(resolve_path("config/prompts/chunk_refinement.txt"))
-        
-        # 确定是否应该使用 LLM
-        self.use_llm = getattr(
-            getattr(settings, 'ingestion', None), 
-            'chunk_refiner', 
-            {}
-        ).get('use_llm', False) if hasattr(settings, 'ingestion') else False
+        self._batch_prompt_path = str(resolve_path("config/prompts/chunk_refinement_batch.txt"))
+
+        # 读取 chunk_refiner 配置（支持 dataclass 和 dict 两种格式）
+        refiner_config = None
+        if hasattr(settings, 'ingestion') and settings.ingestion is not None:
+            refiner_config = getattr(settings.ingestion, 'chunk_refiner', None)
+
+        if refiner_config is not None:
+            self.use_llm = getattr(refiner_config, 'use_llm', False)
+            self.batch_mode = getattr(refiner_config, 'batch_mode', True)
+            self.batch_size = getattr(refiner_config, 'batch_size', 10)
+        else:
+            self.use_llm = False
+            self.batch_mode = True
+            self.batch_size = 10
         
     @property
     def llm(self) -> Optional[BaseLLM]:
@@ -80,45 +87,97 @@ class ChunkRefiner(BaseTransform):
         trace: Optional[TraceContext] = None
     ) -> List[Chunk]:
         """通过优化 pipeline 转换 chunk。
-        
+
         参数：
             chunks: 要优化的 chunk 列表
             trace: 可选的跟踪上下文
-            
+
         返回：
             已优化的 chunk 列表（与输入长度相同）
         """
         if not chunks:
             return []
-        
-        # 并行处理 chunk 如果 LLM 已启用
+
+        # 步骤 1: 所有 chunks 先做规则精化
+        rule_refined: List[Chunk] = []
+        for chunk in chunks:
+            rule_text = self._rule_based_refine(chunk.text)
+            rule_refined.append(Chunk(
+                id=chunk.id,
+                text=rule_text,
+                metadata={**(chunk.metadata or {}), 'refined_by': 'rule'},
+                source_ref=chunk.source_ref
+            ))
+
+        # 步骤 2: 如果启用 LLM，根据 batch_mode 选择处理方式
         if self.use_llm and self.llm:
-            return self._transform_parallel(chunks, trace)
-        else:
-            return self._transform_sequential(chunks, trace)
-    
+            if self.batch_mode:
+                return self._transform_batch(rule_refined, trace)
+            else:
+                return self._transform_parallel(rule_refined, trace)
+
+        return rule_refined
+
+    def _transform_parallel(
+        self,
+        chunks: List[Chunk],
+        trace: Optional[TraceContext] = None
+    ) -> List[Chunk]:
+        """逐 chunk 并行调用 LLM（batch_mode=false）。"""
+        import concurrent.futures
+
+        max_workers = min(5, len(chunks))
+        refined_chunks = [None] * len(chunks)
+        llm_enhanced_count = 0
+        fallback_count = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self._refine_single_chunk, chunk, trace): idx
+                for idx, chunk in enumerate(chunks)
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    refined_chunk, refined_by, _ = future.result()
+                    refined_chunks[idx] = refined_chunk
+                    if refined_by == "llm":
+                        llm_enhanced_count += 1
+                    elif refined_by == "rule":
+                        fallback_count += 1
+                except Exception as e:
+                    logger.error(f"Unexpected error in parallel refinement: {e}")
+                    refined_chunks[idx] = chunks[idx]
+
+        if trace:
+            trace.record_stage("chunk_refiner", {
+                "total_chunks": len(chunks),
+                "llm_enhanced_count": llm_enhanced_count,
+                "fallback_count": fallback_count,
+                "use_llm": self.use_llm,
+                "batch_mode": False,
+                "parallel": True,
+                "max_workers": max_workers,
+            })
+
+        logger.info(
+            f"Refined {len(chunks)} chunks (batch_mode=false) "
+            f"(LLM: {llm_enhanced_count}, fallback: {fallback_count})"
+        )
+
+        return refined_chunks
+
     def _refine_single_chunk(
-        self, 
-        chunk: Chunk, 
+        self,
+        chunk: Chunk,
         trace: Optional[TraceContext] = None
     ) -> Tuple[Chunk, str, Optional[str]]:
-        """优化单个 chunk。线程安全。
-        
-        参数：
-            chunk: 要优化的 chunk
-            trace: 可选的跟踪上下文
-            
-        返回：
-            (refined_chunk, refined_by, error_message) 元组
-        """
+        """优化单个 chunk。"""
         try:
-            # 步骤 1: 基于规则的优化
             rule_refined_text = self._rule_based_refine(chunk.text)
-            
-            # 步骤 2: LLM 增强
+
             if self.use_llm and self.llm:
                 llm_refined_text = self._llm_refine(rule_refined_text, trace)
-                
                 if llm_refined_text:
                     refined_text = llm_refined_text
                     refined_by = "llm"
@@ -128,7 +187,7 @@ class ChunkRefiner(BaseTransform):
             else:
                 refined_text = rule_refined_text
                 refined_by = "rule"
-            
+
             refined_chunk = Chunk(
                 id=chunk.id,
                 text=refined_text,
@@ -139,138 +198,119 @@ class ChunkRefiner(BaseTransform):
                 source_ref=chunk.source_ref
             )
             return (refined_chunk, refined_by, None)
-            
+
         except Exception as e:
             logger.error(f"Failed to refine chunk {chunk.id}: {e}")
             return (chunk, "error", str(e))
-    
-    def _transform_parallel(
-        self, 
-        chunks: List[Chunk], 
+
+    def _transform_batch(
+        self,
+        chunks: List[Chunk],
         trace: Optional[TraceContext] = None
     ) -> List[Chunk]:
-        """使用 ThreadPoolExecutor 并行处理 chunk。"""
-        max_workers = min(DEFAULT_MAX_WORKERS, len(chunks))
-        refined_chunks = [None] * len(chunks)
+        """使用批量 LLM 调用精化 chunks。"""
         llm_enhanced_count = 0
         fallback_count = 0
-        
-        logger.debug(f"Processing {len(chunks)} chunks in parallel (max_workers={max_workers})")
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # 提交所有任务
-            future_to_idx = {
-                executor.submit(self._refine_single_chunk, chunk, trace): idx
-                for idx, chunk in enumerate(chunks)
-            }
-            
-            # 收集结果
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    refined_chunk, refined_by, error = future.result()
-                    refined_chunks[idx] = refined_chunk
-                    
-                    if refined_by == "llm":
-                        llm_enhanced_count += 1
-                    elif refined_by == "rule" and error is None:
-                        fallback_count += 1
-                except Exception as e:
-                    logger.error(f"Unexpected error in parallel refinement: {e}")
-                    refined_chunks[idx] = chunks[idx]
-        
-        success_count = sum(1 for c in refined_chunks if c is not None)
-        
-        if trace:
-            trace.record_stage("chunk_refiner", {
-                "total_chunks": len(chunks),
-                "success_count": success_count,
-                "llm_enhanced_count": llm_enhanced_count,
-                "fallback_count": fallback_count,
-                "use_llm": self.use_llm,
-                "parallel": True,
-                "max_workers": max_workers
-            })
-        
-        logger.info(
-            f"Refined {success_count}/{len(chunks)} chunks "
-            f"(LLM: {llm_enhanced_count}, fallback: {fallback_count})"
-        )
-        
-        return refined_chunks
-    
-    def _transform_sequential(
-        self, 
-        chunks: List[Chunk], 
-        trace: Optional[TraceContext] = None
-    ) -> List[Chunk]:
-        """按顺序处理 chunk（当 LLM 禁用时的回退方案）。"""
-        refined_chunks = []
-        success_count = 0
-        llm_enhanced_count = 0
-        fallback_count = 0
-        
-        for chunk in chunks:
+        results = {chunk.id: chunk for chunk in chunks}
+
+        for i in range(0, len(chunks), self.batch_size):
+            batch = chunks[i:i + self.batch_size]
             try:
-                # 步骤 1: 基于规则的优化（始终执行）
-                rule_refined_text = self._rule_based_refine(chunk.text)
-                
-                # 步骤 2: 可选 LLM 增强
-                if self.use_llm and self.llm:
-                    llm_refined_text = self._llm_refine(rule_refined_text, trace)
-                    
-                    if llm_refined_text:
-                        # LLM 成功
-                        refined_text = llm_refined_text
-                        refined_by = "llm"
+                llm_results = self._llm_refine_batch(batch, trace)
+                for chunk_id, refined_text in llm_results.items():
+                    if chunk_id in results:
+                        results[chunk_id].text = refined_text
+                        results[chunk_id].metadata['refined_by'] = 'llm'
                         llm_enhanced_count += 1
-                    else:
-                        # LLM 失败，回退到基于规则
-                        refined_text = rule_refined_text
-                        refined_by = "rule"
-                        fallback_count += 1
-                        if chunk.metadata:
-                            chunk.metadata['refine_fallback_reason'] = "llm_failed"
-                else:
-                    # LLM 禁用，使用基于规则
-                    refined_text = rule_refined_text
-                    refined_by = "rule"
-                
-                # 创建优化后的 chunk
-                refined_chunk = Chunk(
-                    id=chunk.id,
-                    text=refined_text,
-                    metadata={
-                        **(chunk.metadata or {}),
-                        'refined_by': refined_by
-                    },
-                    source_ref=chunk.source_ref
-                )
-                refined_chunks.append(refined_chunk)
-                success_count += 1
-                
             except Exception as e:
-                # 原子失败：记录并保留原始 chunk
-                logger.error(f"Failed to refine chunk {chunk.id}: {e}")
-                refined_chunks.append(chunk)
-        
-        # 记录 trace
+                logger.warning(f"Batch LLM refinement failed for chunks {i}-{i + len(batch)}: {e}")
+                fallback_count += len(batch)
+
+        # 未被 LLM 处理的保持 rule-based
+        for chunk in results.values():
+            if chunk.metadata.get('refined_by') != 'llm':
+                chunk.metadata['refined_by'] = 'rule'
+                if chunk.id not in getattr(self, '_last_llm_results', {}):
+                    fallback_count += 1
+
         if trace:
             trace.record_stage("chunk_refiner", {
                 "total_chunks": len(chunks),
-                "success_count": success_count,
                 "llm_enhanced_count": llm_enhanced_count,
                 "fallback_count": fallback_count,
                 "use_llm": self.use_llm,
-                "parallel": False
+                "batch_size": self.batch_size,
             })
-        
+
         logger.info(
-            f"Refined {success_count}/{len(chunks)} chunks "
+            f"Refined {len(chunks)} chunks "
             f"(LLM: {llm_enhanced_count}, fallback: {fallback_count})"
         )
-        
-        return refined_chunks
+
+        return list(results.values())
+
+    def _llm_refine_batch(
+        self,
+        chunks: List[Chunk],
+        trace: Optional[TraceContext] = None
+    ) -> Dict[str, str]:
+        """一次 LLM 调用精化一批 chunks。
+
+        返回：
+            {chunk_id: refined_text} 字典
+        """
+        prompt_template = self._load_prompt_batch()
+        if not prompt_template:
+            logger.warning("Batch prompt template not found, skipping LLM refinement")
+            return {}
+
+        # 构建 chunks 文本块
+        chunks_text = ""
+        for chunk in chunks:
+            chunks_text += f"--- CHUNK_START:{chunk.id} ---\n{chunk.text}\n--- CHUNK_END:{chunk.id} ---\n\n"
+
+        prompt = (
+            prompt_template
+            .replace("{chunk_count}", str(len(chunks)))
+            .replace("{chunks}", chunks_text)
+        )
+
+        messages = [Message(role="user", content=prompt)]
+        response = self.llm.chat(messages, trace=trace)
+
+        response_text = response.content if hasattr(response, "content") else str(response)
+        results = self._parse_batch_response(response_text)
+
+        # 记录哪些 chunk 被成功处理（用于 fallback 计数）
+        self._last_llm_results = set(results.keys())
+
+        return results
+
+    def _parse_batch_response(self, response: str) -> Dict[str, str]:
+        """从批量 LLM 响应中解析每个 chunk 的精化结果。
+
+        返回：
+            {chunk_id: refined_text} 字典
+        """
+        results: Dict[str, str] = {}
+        pattern = r"---\s*CHUNK_START:\s*([^\s]+)\s*---\n(.*?)\n---\s*CHUNK_END:\s*\1\s*---"
+        for match in re.finditer(pattern, response, re.DOTALL):
+            chunk_id = match.group(1).strip()
+            content = match.group(2).strip()
+            results[chunk_id] = content
+        return results
+
+    def _load_prompt_batch(self) -> Optional[str]:
+        """加载批量精化 prompt 模板。"""
+        try:
+            prompt_path = Path(self._batch_prompt_path)
+            if not prompt_path.exists():
+                logger.warning(f"Batch prompt file not found: {self._batch_prompt_path}")
+                return None
+            return prompt_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to load batch prompt template: {e}")
+            return None
     
     def _rule_based_refine(self, text: str) -> str:
         """应用基于规则的文本清理。

@@ -19,7 +19,7 @@ from src.observability.logger import get_logger
 
 logger = get_logger(log_level="INFO")
 
-SERVER_NAME = "faber-rag"
+SERVER_NAME = "faya-rag"
 SERVER_VERSION = "0.1.0"
 
 
