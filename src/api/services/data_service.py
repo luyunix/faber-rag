@@ -90,7 +90,10 @@ class DataService:
                 path=persist_dir,
                 settings=ChromaSettings(anonymized_telemetry=False, allow_reset=True),
             )
-            return sorted(c.name for c in client.list_collections())
+            return sorted(
+                c if isinstance(c, str) else c.name
+                for c in client.list_collections()
+            )
         except Exception as exc:
             logger.warning("Failed to list collections: %s", exc)
             return ["default"]
@@ -219,7 +222,8 @@ class DataService:
             )
             colls = client.list_collections()
             for c in colls:
-                client.delete_collection(c.name)
+                name = c if isinstance(c, str) else c.name
+                client.delete_collection(name)
                 summary["collections_deleted"] += 1
         except Exception as exc:
             summary["errors"].append(f"ChromaDB: {exc}")

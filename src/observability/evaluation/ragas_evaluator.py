@@ -32,10 +32,10 @@ def _import_ragas() -> None:
     """验证 ragas 是否可导入，如不可导入则抛出清晰的错误。"""
     try:
         import ragas  # noqa: F401
-    except ImportError as exc:
+    except Exception as exc:
         raise ImportError(
-            "The 'ragas' package is required for RagasEvaluator. "
-            "Install it with: pip install ragas datasets"
+            "RagasEvaluator could not import 'ragas' or one of its dependencies. "
+            f"Original error: {exc}"
         ) from exc
 
 
@@ -224,12 +224,15 @@ class RagasEvaluator(BaseEvaluator):
                 azure_endpoint=llm_azure_endpoint or llm_cfg.azure_endpoint,
                 api_version=getattr(llm_cfg, "api_version", None) or "2024-02-15-preview",
             )
-        elif provider == "openai":
-            llm_client = AsyncOpenAI(api_key=llm_cfg.api_key)
+        elif provider in {"openai", "qwen", "deepseek"}:
+            llm_client = AsyncOpenAI(
+                api_key=llm_cfg.api_key,
+                base_url=getattr(llm_cfg, "base_url", None),
+            )
         else:
             raise ValueError(
                 f"Unsupported LLM provider for Ragas: '{provider}'. "
-                "Supported: azure, openai"
+                "Supported: azure, openai, qwen, deepseek"
             )
 
         llm = llm_factory(llm_cfg.model, client=llm_client, max_tokens=8192)
@@ -251,12 +254,15 @@ class RagasEvaluator(BaseEvaluator):
                 azure_endpoint=emb_azure_endpoint or emb_cfg.azure_endpoint,
                 api_version=getattr(emb_cfg, "api_version", None) or "2024-02-15-preview",
             )
-        elif emb_provider == "openai":
-            emb_client = AsyncOpenAI(api_key=emb_cfg.api_key)
+        elif emb_provider in {"openai", "qwen"}:
+            emb_client = AsyncOpenAI(
+                api_key=emb_cfg.api_key,
+                base_url=getattr(emb_cfg, "base_url", None),
+            )
         else:
             raise ValueError(
                 f"Unsupported embedding provider for Ragas: '{emb_provider}'. "
-                "Supported: azure, openai"
+                "Supported: azure, openai, qwen"
             )
 
         embeddings = OpenAIEmbeddings(model=emb_cfg.model, client=emb_client)
@@ -295,4 +301,5 @@ class RagasEvaluator(BaseEvaluator):
         raw_metrics = getattr(evaluation, "metrics", None)
         if raw_metrics is None:
             return []
-        # 过滤器 to only ragas-supported metrics        return [m for m in raw_metrics if m.lower() in SUPPORTED_METRICS]
+        # Only keep ragas-supported metrics.
+        return [m for m in raw_metrics if str(m).lower() in SUPPORTED_METRICS]

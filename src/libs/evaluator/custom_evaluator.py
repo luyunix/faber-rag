@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from pathlib import PurePath
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from src.libs.evaluator.base_evaluator import BaseEvaluator
 
@@ -20,6 +21,8 @@ class CustomEvaluator(BaseEvaluator):
 
     SUPPORTED_METRICS = {"hit_rate", "mrr"}
     _ID_FIELDS = ("id", "chunk_id", "document_id", "doc_id")
+    _SOURCE_FIELDS = ("source", "source_path", "file_path", "filename")
+    requires_retrieval_ground_truth = True
 
     def __init__(
         self,
@@ -69,17 +72,35 @@ class CustomEvaluator(BaseEvaluator):
             指标名称到浮点数值的字典。
         """
         self.validate_query(query)
-        self.validate_retrieved_chunks(retrieved_chunks)
+        if not isinstance(retrieved_chunks, list):
+            raise ValueError("retrieved_chunks 必须是列表")
 
         retrieved_ids = self._extract_ids(retrieved_chunks, label="retrieved_chunks")
-        ground_truth_ids = self._extract_ground_truth_ids(ground_truth)
+        retrieved_sources = [self._extract_sources(item) for item in retrieved_chunks]
+        ground_truth_ids, ground_truth_sources = self._extract_ground_truth(ground_truth)
+
+        if not ground_truth_ids and not ground_truth_sources:
+            raise ValueError(
+                "CustomEvaluator 需要正确答案标签。请在测试用例中提供 "
+                "expected_chunk_ids 或 expected_sources。"
+            )
+
+        relevance = [
+            self._is_relevant(
+                retrieved_id=retrieved_id,
+                retrieved_sources=retrieved_sources[index],
+                ground_truth_ids=ground_truth_ids,
+                ground_truth_sources=ground_truth_sources,
+            )
+            for index, retrieved_id in enumerate(retrieved_ids)
+        ]
 
         results: Dict[str, float] = {}
 
         if "hit_rate" in self.metrics:
-            results["hit_rate"] = self._compute_hit_rate(retrieved_ids, ground_truth_ids)
+            results["hit_rate"] = 1.0 if any(relevance) else 0.0
         if "mrr" in self.metrics:
-            results["mrr"] = self._compute_mrr(retrieved_ids, ground_truth_ids)
+            results["mrr"] = self._compute_mrr_from_relevance(relevance)
 
         return results
 
@@ -101,7 +122,9 @@ class CustomEvaluator(BaseEvaluator):
         if isinstance(ground_truth, dict):
             if "ids" in ground_truth and isinstance(ground_truth["ids"], list):
                 return self._extract_ids(ground_truth["ids"], label="ground_truth.ids")
-            return self._extract_ids([ground_truth], label="ground_truth")
+            if any(field in ground_truth for field in self._ID_FIELDS):
+                return self._extract_ids([ground_truth], label="ground_truth")
+            return []
         if isinstance(ground_truth, list):
             return self._extract_ids(ground_truth, label="ground_truth")
 
@@ -109,6 +132,28 @@ class CustomEvaluator(BaseEvaluator):
             f"不支持的 ground_truth 类型：{type(ground_truth).__name__}。"
             "期望 str、dict、list 或 None。"
         )
+
+    def _extract_ground_truth(
+        self,
+        ground_truth: Optional[Any],
+    ) -> Tuple[List[str], Set[str]]:
+        """提取正确 chunk ID 和来源文件标签。"""
+        ids = self._extract_ground_truth_ids(ground_truth)
+        sources: Set[str] = set()
+
+        if isinstance(ground_truth, dict):
+            raw_sources = ground_truth.get("sources", [])
+            if isinstance(raw_sources, str):
+                raw_sources = [raw_sources]
+            if not isinstance(raw_sources, list):
+                raise ValueError("ground_truth.sources 必须是字符串或字符串列表")
+            sources = {
+                normalized
+                for source in raw_sources
+                if (normalized := self._normalize_source(source))
+            }
+
+        return ids, sources
 
     def _extract_ids(self, items: Iterable[Any], label: str) -> List[str]:
         """从项目列表中提取 ID。"""
@@ -131,12 +176,65 @@ class CustomEvaluator(BaseEvaluator):
             if hasattr(item, "id"):
                 ids.append(str(getattr(item, "id")))
                 continue
+            if hasattr(item, "chunk_id"):
+                ids.append(str(getattr(item, "chunk_id")))
+                continue
 
             raise ValueError(
                 f"无法从 {label}[{index}]（类型 {type(item).__name__}）中提取 ID"
             )
 
         return ids
+
+    def _extract_sources(self, item: Any) -> Set[str]:
+        """从检索结果本身及其 metadata 中提取来源路径。"""
+        candidates: List[Any] = []
+
+        if isinstance(item, dict):
+            candidates.extend(item.get(field) for field in self._SOURCE_FIELDS)
+            metadata = item.get("metadata", {})
+        else:
+            candidates.extend(getattr(item, field, None) for field in self._SOURCE_FIELDS)
+            metadata = getattr(item, "metadata", {})
+
+        if isinstance(metadata, dict):
+            candidates.extend(metadata.get(field) for field in self._SOURCE_FIELDS)
+
+        return {
+            normalized
+            for candidate in candidates
+            if (normalized := self._normalize_source(candidate))
+        }
+
+    @staticmethod
+    def _normalize_source(source: Any) -> str:
+        if source is None:
+            return ""
+        return str(source).strip().replace("\\", "/").lower()
+
+    def _is_relevant(
+        self,
+        retrieved_id: str,
+        retrieved_sources: Set[str],
+        ground_truth_ids: Sequence[str],
+        ground_truth_sources: Set[str],
+    ) -> bool:
+        if retrieved_id in ground_truth_ids:
+            return True
+
+        for actual in retrieved_sources:
+            actual_name = PurePath(actual).name
+            for expected in ground_truth_sources:
+                if actual == expected or actual_name == PurePath(expected).name:
+                    return True
+        return False
+
+    @staticmethod
+    def _compute_mrr_from_relevance(relevance: Sequence[bool]) -> float:
+        for rank, matched in enumerate(relevance, start=1):
+            if matched:
+                return 1.0 / rank
+        return 0.0
 
     def _compute_hit_rate(self, retrieved_ids: Sequence[str], ground_truth_ids: Sequence[str]) -> float:
         """计算命中率（二值）。"""

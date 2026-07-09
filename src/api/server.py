@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import shutil
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +27,7 @@ from src.core.settings import load_settings, resolve_path, Settings, SettingsErr
 from src.api.services.data_service import DataService
 from src.api.services.trace_service import TraceService
 from src.api.services.config_service import ConfigService
+from src.api.services.query_service import QueryService
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,7 @@ app.add_middleware(
 _data_service: Optional[DataService] = None
 _trace_service: Optional[TraceService] = None
 _config_service: Optional[ConfigService] = None
+_query_service: Optional[QueryService] = None
 
 
 def get_data_service() -> DataService:
@@ -186,6 +188,13 @@ def get_config_service() -> ConfigService:
     if _config_service is None:
         _config_service = ConfigService()
     return _config_service
+
+
+def get_query_service() -> QueryService:
+    global _query_service
+    if _query_service is None:
+        _query_service = QueryService()
+    return _query_service
 
 
 # ── Health Check ─────────────────────────────────────────────────
@@ -234,7 +243,7 @@ async def get_collection_stats():
 
         stats = []
         for col in client.list_collections():
-            name = col.name if hasattr(col, "name") else str(col)
+            name = col if isinstance(col, str) else col.name
             collection = client.get_collection(name)
             stats.append(CollectionStats(
                 collection=name,
@@ -292,6 +301,7 @@ async def update_raw_settings(request_body: Dict[str, Any]):
 
         # 清除 ConfigService 缓存，使新配置尽快生效
         get_config_service().reload()
+        get_query_service().reload()
 
         return {"success": True, "message": "配置已保存"}
     except HTTPException:
@@ -421,20 +431,23 @@ async def upload_and_ingest(
     collection: str = Form("default")
 ):
     """上传并处理文档。"""
-    import tempfile
-    from src.core.settings import load_settings
     from src.ingestion.pipeline import IngestionPipeline
     from src.core.trace import TraceContext, TraceCollector
 
+    tmp_path: Optional[str] = None
+    trace: Optional[TraceContext] = None
     try:
         settings = load_settings()
 
         # 保存上传的文件到临时位置
         suffix = Path(file.filename or "upload").suffix
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await file.read()
-            tmp.write(content)
             tmp_path = tmp.name
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
 
         # 运行处理流程
         trace = TraceContext(trace_type="ingestion")
@@ -442,12 +455,19 @@ async def upload_and_ingest(
         trace.metadata["collection"] = collection
         trace.metadata["source"] = "dashboard"
 
-        pipeline = IngestionPipeline(settings, collection=collection)
-        result = pipeline.run(
-            file_path=tmp_path,
-            trace=trace,
-            on_progress=lambda stage, current, total: None,  # 简化，暂不报告进度
-        )
+        def _run_pipeline():
+            pipeline = IngestionPipeline(settings, collection=collection)
+            try:
+                return pipeline.run(
+                    file_path=tmp_path,
+                    trace=trace,
+                    on_progress=lambda stage, current, total: None,  # 简化，暂不报告进度
+                    source_path=file.filename or tmp_path,
+                )
+            finally:
+                pipeline.close()
+
+        result = await asyncio.to_thread(_run_pipeline)
 
         # 记录追踪
         try:
@@ -456,20 +476,26 @@ async def upload_and_ingest(
         except Exception as e:
             logger.exception("Failed to collect ingestion trace: %s", e)
 
-        # 清理临时文件
-        Path(tmp_path).unlink(missing_ok=True)
-
         return {
             "doc_id": result.doc_id if result else "",
-            "success": True
+            "success": bool(result and result.success),
+            "error": None if result and result.success else (result.error if result else "empty result"),
         }
     except Exception as e:
         logger.exception("Failed to upload and ingest")
+        if trace is not None:
+            try:
+                TraceCollector().collect(trace)
+            except Exception:
+                logger.exception("Failed to collect failed ingestion trace")
         return {
             "doc_id": "",
             "success": False,
             "error": str(e)
         }
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 # ── Trace Endpoints ─────────────────────────────────────────────
@@ -544,6 +570,7 @@ async def get_trace(trace_id: str):
 @app.post("/api/evaluation/run", response_model=EvaluationReport)
 async def run_evaluation(request: EvaluationRunRequest):
     """运行评估。"""
+    tmp_path: Optional[str] = None
     try:
         import json
         from dataclasses import replace as dc_replace
@@ -556,7 +583,11 @@ async def run_evaluation(request: EvaluationRunRequest):
         settings = load_settings()
 
         # 解析用户答案
-        answers_dict = request.user_answers or {}
+        answers_dict = {
+            int(k): v
+            for k, v in (request.user_answers or {}).items()
+            if str(k).isdigit()
+        }
 
         # 覆盖评估设置
         eval_settings = EvaluationSettings(
@@ -570,8 +601,6 @@ async def run_evaluation(request: EvaluationRunRequest):
 
         # 加载测试集
         golden_path = None
-        tmp_path = None
-
         if request.test_set_content:
             # 前端直接传入 JSON 内容，写入临时文件
             import tempfile
@@ -587,51 +616,12 @@ async def run_evaluation(request: EvaluationRunRequest):
         else:
             raise HTTPException(status_code=400, detail="请提供 Golden Test Set 路径或直接上传 JSON 内容")
 
-        # 创建检索器
         target_collection = request.collection or "default"
-        try:
-            from src.core.query_engine.query_processor import QueryProcessor
-            from src.core.query_engine.hybrid_search import create_hybrid_search
-            from src.core.query_engine.dense_retriever import create_dense_retriever
-            from src.core.query_engine.sparse_retriever import create_sparse_retriever
-            from src.ingestion.storage.bm25_indexer import BM25Indexer
-            from src.libs.embedding.embedding_factory import EmbeddingFactory
-            from src.libs.vector_store.vector_store_factory import VectorStoreFactory
-
-            vector_store = VectorStoreFactory.create(settings, collection_name=target_collection)
-            embedding_client = EmbeddingFactory.create(settings)
-            dense_retriever = create_dense_retriever(
-                settings=settings,
-                embedding_client=embedding_client,
-                vector_store=vector_store,
-            )
-            bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{target_collection}")))
-            sparse_retriever = create_sparse_retriever(
-                settings=settings,
-                bm25_indexer=bm25_indexer,
-                vector_store=vector_store,
-            )
-            sparse_retriever.default_collection = target_collection
-            query_processor = QueryProcessor()
-            hybrid_search = create_hybrid_search(
-                settings=settings,
-                query_processor=query_processor,
-                dense_retriever=dense_retriever,
-                sparse_retriever=sparse_retriever,
-            )
-        except Exception as e:
-            logger.warning(f"Could not create hybrid search: {e}")
-            hybrid_search = None
-
-        # 创建 reranker
-        reranker = None
-        try:
-            from src.core.query_engine.reranker import create_core_reranker
-            reranker = create_core_reranker(settings=settings)
-            if not reranker.is_enabled:
-                reranker = None
-        except Exception as e:
-            logger.warning(f"Could not create reranker: {e}")
+        query_service = get_query_service()
+        hybrid_search = query_service.get_hybrid_search(target_collection)
+        reranker = query_service.get_reranker()
+        if not reranker.is_enabled:
+            reranker = None
 
         # 运行评估
         runner = EvalRunner(
@@ -642,15 +632,16 @@ async def run_evaluation(request: EvaluationRunRequest):
             reranker=reranker,
         )
 
-        report = runner.run(
+        report = await asyncio.to_thread(
+            runner.run,
             test_set_path=golden_path,
             top_k=request.top_k,
-            collection=request.collection,
+            collection=target_collection,
         )
 
         result = EvaluationReport(
             evaluator_name=report.evaluator_name,
-            query_count=report.query_count,
+            query_count=len(report.query_results),
             total_elapsed_ms=report.total_elapsed_ms,
             aggregate_metrics=report.aggregate_metrics,
             query_results=[
@@ -667,6 +658,8 @@ async def run_evaluation(request: EvaluationRunRequest):
         return result
     except HTTPException:
         raise
+    except (ValueError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.exception("Failed to run evaluation")
         raise HTTPException(status_code=500, detail=str(e))
@@ -674,7 +667,7 @@ async def run_evaluation(request: EvaluationRunRequest):
         # Clean up temporary file if created from test_set_content
         if tmp_path:
             try:
-                PathlibPath(tmp_path).unlink(missing_ok=True)
+                Path(tmp_path).unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -683,17 +676,9 @@ async def run_evaluation(request: EvaluationRunRequest):
 async def evaluate_single_trace(request: EvaluateTraceRequest):
     """评估单个查询追踪。"""
     try:
-        import json
         from dataclasses import replace as dc_replace
         from src.core.settings import EvaluationSettings
         from src.libs.evaluator.evaluator_factory import EvaluatorFactory
-        from src.core.query_engine.hybrid_search import create_hybrid_search
-        from src.core.query_engine.query_processor import QueryProcessor
-        from src.core.query_engine.dense_retriever import create_dense_retriever
-        from src.core.query_engine.sparse_retriever import create_sparse_retriever
-        from src.ingestion.storage.bm25_indexer import BM25Indexer
-        from src.libs.embedding.embedding_factory import EmbeddingFactory
-        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
 
         settings = load_settings()
 
@@ -706,53 +691,29 @@ async def evaluate_single_trace(request: EvaluateTraceRequest):
         settings = dc_replace(settings, evaluation=ragas_eval)
         evaluator = EvaluatorFactory.create(settings)
 
-        # 重新运行检索
         collection = request.meta.get("collection", "default")
         top_k = request.meta.get("top_k", 10)
 
-        try:
-            vector_store = VectorStoreFactory.create(settings, collection_name=collection)
-            embedding_client = EmbeddingFactory.create(settings)
-            dense_retriever = create_dense_retriever(
-                settings=settings,
-                embedding_client=embedding_client,
-                vector_store=vector_store,
+        def _search_and_evaluate():
+            chunks = get_query_service().search(
+                query=request.query,
+                top_k=top_k,
+                collection=collection,
+                apply_rerank=True,
             )
-            bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
-            sparse_retriever = create_sparse_retriever(
-                settings=settings,
-                bm25_indexer=bm25_indexer,
-                vector_store=vector_store,
+            if not chunks:
+                return {"error": "未检索到片段"}
+            metrics = evaluator.evaluate(
+                query=request.query,
+                retrieved_chunks=chunks,
+                generated_answer=request.user_answer,
             )
-            sparse_retriever.default_collection = collection
-            query_processor = QueryProcessor()
-            hybrid_search = create_hybrid_search(
-                settings=settings,
-                query_processor=query_processor,
-                dense_retriever=dense_retriever,
-                sparse_retriever=sparse_retriever,
-            )
-        except Exception as e:
-            logger.warning(f"Could not create hybrid search: {e}")
-            return {"error": f"检索失败: {str(e)}"}
+            return {
+                "metrics": metrics,
+                "answer_used": request.user_answer,
+            }
 
-        chunks = hybrid_search.search(query=request.query, top_k=top_k)
-        chunks = chunks if isinstance(chunks, list) else chunks.results
-
-        if not chunks:
-            return {"error": "未检索到片段"}
-
-        # 评估
-        metrics = evaluator.evaluate(
-            query=request.query,
-            retrieved_chunks=chunks,
-            generated_answer=request.user_answer,
-        )
-
-        return {
-            "metrics": metrics,
-            "answer_used": request.user_answer
-        }
+        return await asyncio.to_thread(_search_and_evaluate)
     except Exception as e:
         logger.exception("Failed to evaluate trace")
         return {"error": str(e)}
@@ -806,19 +767,6 @@ async def get_evaluation_history(
 async def direct_query(request: DirectQueryRequest):
     """直接执行查询，绕过 MCP 协议。"""
     try:
-        from src.core.query_engine.query_processor import QueryProcessor
-        from src.core.query_engine.hybrid_search import create_hybrid_search
-        from src.core.query_engine.dense_retriever import create_dense_retriever
-        from src.core.query_engine.sparse_retriever import create_sparse_retriever
-        from src.core.query_engine.reranker import create_core_reranker
-        from src.ingestion.storage.bm25_indexer import BM25Indexer
-        from src.libs.embedding.embedding_factory import EmbeddingFactory
-        from src.libs.vector_store.vector_store_factory import VectorStoreFactory
-        from src.core.response.response_builder import ResponseBuilder
-        from src.core.trace import TraceContext, TraceCollector
-        import time
-
-        settings = load_settings()
         collection = request.collection or "default"
         top_k = request.top_k or 10
         query = request.query.strip()
@@ -826,106 +774,14 @@ async def direct_query(request: DirectQueryRequest):
         if not query:
             raise HTTPException(status_code=400, detail="Query cannot be empty")
 
-        # Create trace
-        trace = TraceContext(trace_type="query")
-        trace.metadata["query"] = query[:200]
-        trace.metadata["top_k"] = top_k
-        trace.metadata["collection"] = collection
-        trace.metadata["source"] = "direct_api"
-
-        # Initialize components
-        t0 = time.monotonic()
-        vector_store = VectorStoreFactory.create(settings, collection_name=collection)
-        embedding_client = EmbeddingFactory.create(settings)
-        dense_retriever = create_dense_retriever(
-            settings=settings,
-            embedding_client=embedding_client,
-            vector_store=vector_store,
-        )
-        bm25_indexer = BM25Indexer(index_dir=str(resolve_path(f"data/db/bm25/{collection}")))
-        sparse_retriever = create_sparse_retriever(
-            settings=settings,
-            bm25_indexer=bm25_indexer,
-            vector_store=vector_store,
-        )
-        sparse_retriever.default_collection = collection
-        query_processor = QueryProcessor()
-        hybrid_search = create_hybrid_search(
-            settings=settings,
-            query_processor=query_processor,
-            dense_retriever=dense_retriever,
-            sparse_retriever=sparse_retriever,
-        )
-        init_elapsed = (time.monotonic() - t0) * 1000.0
-        trace.record_stage("initialization", {
-            "collection": collection,
-            "cold_start": init_elapsed > 500,
-        }, elapsed_ms=init_elapsed)
-
-        # Search
-        t0 = time.monotonic()
-        initial_top_k = top_k * 2
-        results = hybrid_search.search(
+        result = await asyncio.to_thread(
+            get_query_service().execute_query,
             query=query,
-            top_k=initial_top_k,
-            filters=None,
-            trace=trace,
-            return_details=False,
-        )
-        results = results if isinstance(results, list) else results.results
-        search_elapsed = (time.monotonic() - t0) * 1000.0
-        trace.record_stage("search", {
-            "result_count": len(results),
-            "initial_top_k": initial_top_k,
-        }, elapsed_ms=search_elapsed)
-
-        # Rerank
-        reranker = create_core_reranker(settings=settings)
-        if reranker and reranker.is_enabled and results:
-            t0 = time.monotonic()
-            rerank_result = reranker.rerank(
-                query=query,
-                results=results,
-                top_k=top_k,
-                trace=trace,
-            )
-            results = rerank_result.results
-            rerank_elapsed = (time.monotonic() - t0) * 1000.0
-            trace.record_stage("rerank", {
-                "used_fallback": rerank_result.used_fallback,
-                "fallback_reason": rerank_result.fallback_reason if rerank_result.used_fallback else None,
-            }, elapsed_ms=rerank_elapsed)
-        else:
-            results = results[:top_k]
-
-        # Build response
-        t0 = time.monotonic()
-        response_builder = ResponseBuilder()
-        response = response_builder.build(
-            results=results,
-            query=query,
+            top_k=top_k,
             collection=collection,
+            source="direct_api",
         )
-        build_elapsed = (time.monotonic() - t0) * 1000.0
-        trace.record_stage("build_response", {
-            "is_empty": response.is_empty,
-            "citation_count": len(response.citations),
-        }, elapsed_ms=build_elapsed)
-
-        # Store final results in trace
-        trace.metadata["final_results"] = [
-            {
-                "chunk_id": r.chunk_id,
-                "score": round(r.score, 4),
-                "text": r.text or "",
-                "source": r.metadata.get("source_path", r.metadata.get("source", "")),
-                "title": r.metadata.get("title", ""),
-            }
-            for r in results
-        ]
-
-        # Collect trace
-        TraceCollector().collect(trace)
+        response = result.response
 
         # Return format matching frontend expectations
         return {

@@ -204,20 +204,28 @@ class ListCollectionsTool:
         collections_info: List[CollectionInfo] = []
         
         try:
-            # Get all collections from ChromaDB            collections = client.list_collections()
+            # Get all collections from ChromaDB
+            collections = client.list_collections()
             
             for collection in collections:
+                if isinstance(collection, str):
+                    collection_name = collection
+                    collection_obj = client.get_collection(collection_name)
+                else:
+                    collection_name = collection.name
+                    collection_obj = collection
+
                 info = CollectionInfo(
-                    name=collection.name,
-                    metadata=collection.metadata
+                    name=collection_name,
+                    metadata=collection_obj.metadata
                 )
                 
                 if include_stats:
                     try:
-                        info.count = collection.count()
+                        info.count = collection_obj.count()
                     except Exception as e:
                         logger.warning(
-                            f"Failed to get count for collection '{collection.name}': {e}"
+                            f"Failed to get count for collection '{collection_name}': {e}"
                         )
                         info.count = None
                 

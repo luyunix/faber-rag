@@ -29,6 +29,7 @@ REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 
 # settings.yaml的默认绝对路径
 DEFAULT_SETTINGS_PATH: Path = REPO_ROOT / "config" / "settings.yaml"
+_SETTINGS_CACHE: Dict[Path, tuple[int, Settings]] = {}
 
 
 def resolve_path(relative: Union[str, Path]) -> Path:
@@ -410,6 +411,11 @@ def load_settings(path: str | Path | None = None) -> Settings:
     if not settings_path.exists():
         raise SettingsError(f"Settings file not found: {settings_path}")
 
+    mtime_ns = settings_path.stat().st_mtime_ns
+    cached = _SETTINGS_CACHE.get(settings_path)
+    if cached and cached[0] == mtime_ns:
+        return cached[1]
+
     with settings_path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     
@@ -418,4 +424,5 @@ def load_settings(path: str | Path | None = None) -> Settings:
 
     settings = Settings.from_dict(data)
     validate_settings(settings)
+    _SETTINGS_CACHE[settings_path] = (mtime_ns, settings)
     return settings

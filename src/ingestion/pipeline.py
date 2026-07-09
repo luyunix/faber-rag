@@ -45,6 +45,14 @@ from src.ingestion.storage.image_storage import ImageStorage
 logger = get_logger(__name__)
 
 
+def _preview_text(value: str, limit: int = 500) -> str:
+    """Return a compact preview for trace payloads."""
+    value = " ".join((value or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
 class PipelineResult:
     """Pipeline 执行结果及详细统计信息。
 
@@ -284,7 +292,7 @@ class IngestionPipeline:
                     "doc_id": document.id,
                     "text_length": len(document.text),
                     "image_count": image_count,
-                    "text_preview": document.text,
+                    "text_preview": _preview_text(document.text),
                 }, elapsed_ms=_elapsed)
 
             # ─────────────────────────────────────────────────────────────
@@ -324,7 +332,7 @@ class IngestionPipeline:
                     "chunks": [
                         {
                             "chunk_id": c.id,
-                            "text": c.text,
+                            "text_preview": _preview_text(c.text),
                             "char_len": len(c.text),
                             "chunk_index": c.metadata.get("chunk_index", i),
                         }
@@ -384,8 +392,8 @@ class IngestionPipeline:
                     "chunks": [
                         {
                             "chunk_id": c.id,
-                            "text_before": _pre_refine_texts.get(c.id, ""),
-                            "text_after": c.text,
+                            "text_before_preview": _preview_text(_pre_refine_texts.get(c.id, "")),
+                            "text_after_preview": _preview_text(c.text),
                             "char_len": len(c.text),
                             "refined_by": c.metadata.get("refined_by", ""),
                             "enriched_by": c.metadata.get("enriched_by", ""),
@@ -523,39 +531,55 @@ class IngestionPipeline:
                     }, elapsed_ms=(time.monotonic() - _t0_storage) * 1000.0)
                 raise
             
-            # 将 BM25 分块 ID 与 Chroma 向量 ID 对齐，以便 SparseRetriever
-            # 可以在检索后在向量存储中查找 BM25 命中结果。
-            logger.info(f"      关联 {len(sparse_stats)} 个 BM25 统计到向量 ID...")
-            for stat, vid in zip(sparse_stats, vector_ids):
-                stat["chunk_id"] = vid
+            try:
+                # 将 BM25 分块 ID 与 Chroma 向量 ID 对齐，以便 SparseRetriever
+                # 可以在检索后在向量存储中查找 BM25 命中结果。
+                logger.info(f"      关联 {len(sparse_stats)} 个 BM25 统计到向量 ID...")
+                for stat, vid in zip(sparse_stats, vector_ids):
+                    stat["chunk_id"] = vid
 
-            # 6b：BM25 索引
-            logger.info("  6b. BM25 索引...")
-            logger.info(f"      准备为 {len(sparse_stats)} 个文档构建索引")
-            self.bm25_indexer.add_documents(
-                sparse_stats,
-                collection=self.collection,
-                doc_id=document.id,
-                trace=trace,
-            )
-            logger.info(f"      ✅ 完成索引构建")
+                # 6b：BM25 索引
+                logger.info("  6b. BM25 索引...")
+                logger.info(f"      准备为 {len(sparse_stats)} 个文档构建索引")
+                self.bm25_indexer.add_documents(
+                    sparse_stats,
+                    collection=self.collection,
+                    doc_id=document.id,
+                    trace=trace,
+                )
+                logger.info(f"      ✅ 完成索引构建")
 
-            # 6c：在图片存储索引中注册图片
-            # 注意：图片已由 PdfLoader 保存，我们只需要索引它们
-            logger.info("  6c. 图片存储索引...")
-            images = document.metadata.get("images", [])
-            logger.info(f"      发现 {len(images)} 张图片")
-            for img in images:
-                img_path = Path(img["path"])
-                if img_path.exists():
-                    self.image_storage.register_image(
-                        image_id=img["id"],
-                        file_path=img_path,
-                        collection=self.collection,
-                        doc_hash=file_hash,
-                        page_num=img.get("page", 0)
-                    )
-            logger.info(f"      ✅ 索引了 {len(images)} 张图片")
+                # 6c：在图片存储索引中注册图片
+                # 注意：图片已由 PdfLoader 保存，我们只需要索引它们
+                logger.info("  6c. 图片存储索引...")
+                images = document.metadata.get("images", [])
+                logger.info(f"      发现 {len(images)} 张图片")
+                for img in images:
+                    img_path = Path(img["path"])
+                    if img_path.exists():
+                        self.image_storage.register_image(
+                            image_id=img["id"],
+                            file_path=img_path,
+                            collection=self.collection,
+                            doc_hash=file_hash,
+                            page_num=img.get("page", 0)
+                        )
+                logger.info(f"      ✅ 索引了 {len(images)} 张图片")
+            except Exception as e:
+                logger.error("  ❌ 索引阶段失败，正在回滚已写入向量：%s", e, exc_info=True)
+                try:
+                    if vector_ids:
+                        self.vector_upserter.vector_store.delete(vector_ids)
+                        logger.info("      已回滚 %d 个向量", len(vector_ids))
+                except Exception as rollback_error:
+                    logger.exception("      向量回滚失败：%s", rollback_error)
+                stages["storage"] = {
+                    **stages.get("storage", {}),
+                    "error": str(e),
+                    "type": type(e).__name__,
+                    "rolled_back_vectors": len(vector_ids),
+                }
+                raise
             
             # 更新 stages 中的详细信息
             stages["storage"].update({

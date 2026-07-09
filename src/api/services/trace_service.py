@@ -47,15 +47,7 @@ class TraceService:
         返回：
             追踪字典列表（最新的在前）。
         """
-        traces = self._load_all()
-
-        if trace_type:
-            traces = [t for t in traces if t.get("trace_type") == trace_type]
-
-        # 最新的在前
-        traces.sort(key=lambda t: t.get("started_at", ""), reverse=True)
-
-        return traces[:limit]
+        return self._load_recent(trace_type=trace_type, limit=limit)
 
     def get_trace(self, trace_id: str) -> Optional[Dict[str, Any]]:
         """通过 ``trace_id`` 检索单个追踪记录。
@@ -63,7 +55,7 @@ class TraceService:
         返回：
             追踪字典，如未找到则返回 ``None``。
         """
-        for t in self._load_all():
+        for t in self._iter_traces_reverse():
             if t.get("trace_id") == trace_id:
                 return t
         return None
@@ -115,3 +107,52 @@ class TraceService:
                 except json.JSONDecodeError:
                     logger.debug("Skipping malformed trace line: %s", line[:80])
         return traces
+
+    def _load_recent(
+        self,
+        trace_type: Optional[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Load recent traces by reading the JSONL file from the tail."""
+        traces: List[Dict[str, Any]] = []
+        for trace in self._iter_traces_reverse():
+            if trace_type and trace.get("trace_type") != trace_type:
+                continue
+            traces.append(trace)
+            if len(traces) >= limit:
+                break
+        return traces
+
+    def _iter_traces_reverse(self):
+        """Yield parsed traces from newest to oldest."""
+        if not self.traces_path.exists():
+            return
+        for line in self._iter_lines_reverse():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug("Skipping malformed trace line: %s", line[:80])
+
+    def _iter_lines_reverse(self, block_size: int = 8192):
+        """Yield decoded lines from a text file in reverse order."""
+        with self.traces_path.open("rb") as fh:
+            fh.seek(0, 2)
+            position = fh.tell()
+            buffer = b""
+
+            while position > 0:
+                read_size = min(block_size, position)
+                position -= read_size
+                fh.seek(position)
+                chunk = fh.read(read_size)
+                parts = (chunk + buffer).split(b"\n")
+                buffer = parts[0]
+                for part in reversed(parts[1:]):
+                    if part:
+                        yield part.decode("utf-8", errors="replace")
+
+            if buffer:
+                yield buffer.decode("utf-8", errors="replace")

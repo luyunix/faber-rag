@@ -42,11 +42,30 @@ class GoldenTestCase:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> GoldenTestCase:
+        if not isinstance(data, dict):
+            raise ValueError("每个测试用例必须是 JSON 对象")
+
+        query = data.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query 必须是非空字符串")
+
+        def string_list(field_name: str, fallback_name: Optional[str] = None) -> List[str]:
+            value = data.get(field_name)
+            if value is None and fallback_name:
+                value = data.get(fallback_name)
+            if value is None:
+                return []
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"{field_name} 必须是字符串或字符串列表")
+            return [item.strip() for item in value if item.strip()]
+
         return cls(
-            query=data["query"],
-            expected_chunk_ids=data.get("expected_chunk_ids", []),
-            expected_sources=data.get("expected_sources", []),
-            reference_answer=data.get("reference_answer"),
+            query=query.strip(),
+            expected_chunk_ids=string_list("expected_chunk_ids", "expected_chunks"),
+            expected_sources=string_list("expected_sources"),
+            reference_answer=data.get("reference_answer", data.get("expected_answer")),
         )
 
 
@@ -127,15 +146,31 @@ def load_test_set(path: str | Path) -> List[GoldenTestCase]:
     if not file_path.exists():
         raise FileNotFoundError(f"Golden test set not found: {file_path}")
 
-    with file_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if "test_cases" not in data:
+    try:
+        with file_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
         raise ValueError(
-            "Invalid golden test set format: missing 'test_cases' key."
+            f"Golden Test Set JSON 格式错误：第 {exc.lineno} 行，第 {exc.colno} 列"
+        ) from exc
+
+    if isinstance(data, list):
+        test_cases = data
+    elif isinstance(data, dict) and "test_cases" in data:
+        test_cases = data["test_cases"]
+    else:
+        raise ValueError(
+            "Invalid golden test set format: expected a JSON object with "
+            "'test_cases' or a JSON array of test cases."
         )
 
-    return [GoldenTestCase.from_dict(tc) for tc in data["test_cases"]]
+    parsed: List[GoldenTestCase] = []
+    for index, test_case in enumerate(test_cases, start=1):
+        try:
+            parsed.append(GoldenTestCase.from_dict(test_case))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"第 {index} 个测试用例无效：{exc}") from exc
+    return parsed
 
 
 class EvalRunner:
@@ -216,6 +251,18 @@ class EvalRunner:
         if not test_cases:
             raise ValueError("Golden test set is empty.")
 
+        if getattr(self.evaluator, "requires_retrieval_ground_truth", False):
+            missing_labels = [
+                str(index)
+                for index, test_case in enumerate(test_cases, start=1)
+                if not test_case.expected_chunk_ids and not test_case.expected_sources
+            ]
+            if missing_labels:
+                raise ValueError(
+                    "Custom 评估需要每道题提供 expected_chunk_ids 或 expected_sources。"
+                    f"缺少标签的题号：{', '.join(missing_labels)}"
+                )
+
         logger.info(
             "Starting evaluation: %d test cases, evaluator=%s",
             len(test_cases),
@@ -286,11 +333,10 @@ class EvalRunner:
         qr.generated_answer = answer
 
         # 第 3 步：构建基准真值
-        ground_truth = (
-            {"ids": test_case.expected_chunk_ids}
-            if test_case.expected_chunk_ids
-            else None
-        )
+        ground_truth = {
+            "ids": test_case.expected_chunk_ids,
+            "sources": test_case.expected_sources,
+        }
 
         # 第 4 步：评估
         try:
